@@ -146,50 +146,23 @@ class YOLOv7_DeepSORT:
             indices = preprocessing.non_max_suppression(boxs, classes, self.nms_max_overlap, scores)
             detections = [detections[i] for i in indices]
 
-            num_frames = 20
-            for i in range(num_frames):
-                self.tracker.predict()
-                if (i == 0) or (i == 19):
+            self.tracker.predict()  # Call the tracker
+            self.tracker.update(detections) #  updtate using Kalman Gain
 
-                    for track in self.tracker.tracks:
-                        if not track.is_confirmed() or track.time_since_update > 1:
-                            continue
-                        bbox = track.to_tlbr()
-                        class_name = track.get_class()
-                        color = colors[int(track.track_id) % len(colors)]
-                        color = [i * 255 for i in color]
-                        cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
-                        cv2.rectangle(frame, (int(bbox[0]), int(bbox[1] - 30)),
-                                      (int(bbox[0]) + (len(class_name) + len(str(track.track_id))) * 17, int(bbox[1])),
-                                      color, -1)
-                        cv2.putText(frame, class_name + " : " + str(track.track_id), (int(bbox[0]), int(bbox[1] - 11)),
-                                    0,
-                                    0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
-                        if verbose == 2:
-                            print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(
-                                str(track.track_id), class_name,
-                                (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
-                print(i)
-                self.tracker.update(detections)
-                i += 1
+            for track in self.tracker.tracks:  # update new findings AKA tracks
+                if not track.is_confirmed() or track.time_since_update > 1:
+                    continue
+                bbox = track.to_tlbr()
+                class_name = track.get_class()
 
-            # self.tracker.predict()  # Call the tracker
-            # self.tracker.update(detections) #  updtate using Kalman Gain
-            #
-            # for track in self.tracker.tracks:  # update new findings AKA tracks
-            #     if not track.is_confirmed() or track.time_since_update > 1:
-            #         continue
-            #     bbox = track.to_tlbr()
-            #     class_name = track.get_class()
-            #
-            #     color = colors[int(track.track_id) % len(colors)]  # draw bbox on screen
-            #     color = [i * 255 for i in color]
-            #     cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
-            #     cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
-            #     cv2.putText(frame, class_name + " : " + str(track.track_id),(int(bbox[0]), int(bbox[1]-11)),0, 0.6, (255,255,255),1, lineType=cv2.LINE_AA)
-            #
-            #     if verbose == 2:
-            #         print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
+                color = colors[int(track.track_id) % len(colors)]  # draw bbox on screen
+                color = [i * 255 for i in color]
+                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
+                cv2.putText(frame, class_name + " : " + str(track.track_id),(int(bbox[0]), int(bbox[1]-11)),0, 0.6, (255,255,255),1, lineType=cv2.LINE_AA)
+
+                if verbose == 2:
+                    print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
 
             # -------------------------------- Tracker work ENDS here -----------------------------------------------------------------------
             if verbose >= 1:
