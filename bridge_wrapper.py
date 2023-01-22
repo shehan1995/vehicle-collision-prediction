@@ -28,10 +28,29 @@ from deep_sort.tracker import Tracker
 from tracking_helpers import read_class_names, create_box_encoder
 from detection_helpers import *
 
+from detection_3d import Detection3D, DetectedObject
+from torch_lib import Model, ClassAverages
+from torchvision.models import vgg
+from library.Plotting import *
+
+
 # load configuration for object detector
 config = ConfigProto()
 config.gpu_options.allow_growth = True
 
+def plot_regressed_3d_bbox(img, cam_to_img, box_2d, dimensions, alpha, theta_ray, img_2d=None):
+
+    # the math! returns X, the corners used for constraint
+    location, X = calc_location(dimensions, cam_to_img, box_2d, alpha, theta_ray)
+
+    orient = alpha + theta_ray
+
+    if img_2d is not None:
+        plot_2d_box(img_2d, box_2d)
+
+    plot_3d_box(img, cam_to_img, orient, dimensions, location) # 3d boxes
+
+    return location
 
 class YOLOv7_DeepSORT:
     '''
@@ -78,6 +97,21 @@ class YOLOv7_DeepSORT:
         except:
             vid = cv2.VideoCapture(video)
 
+        calib_file = "calib_cam_to_cam.txt"
+
+        # load model for 3D detection
+
+        my_vgg = vgg.vgg19_bn(pretrained=True)
+        # TODO: load bins from file or something
+        model = Model.Model(features=my_vgg.features, bins=2).cuda()
+        checkpoint = torch.load("epoch_10.pkl")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+
+        averages = ClassAverages.ClassAverages()
+        # TODO: clean up how this is done. flag?
+        angle_bins = Detection3D.generate_bins(2)
+
         out = None
         if output:  # get video ready to save locally if flag is set
             width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))  # by default VideoCapture returns float instead of int
@@ -93,6 +127,9 @@ class YOLOv7_DeepSORT:
                 print('Video has ended or failed!')
                 break
             frame_num += 1
+
+            # for 3D detection
+            img = np.copy(frame)
 
             if skip_frames and not frame_num % skip_frames: continue  # skip every nth frame. When every frame is not important, you can use this to fasten the process
             if verbose >= 1: start_time = time.time()
@@ -130,39 +167,101 @@ class YOLOv7_DeepSORT:
                 cv2.putText(frame, "Objects being tracked: {}".format(count), (5, 35), cv2.FONT_HERSHEY_COMPLEX_SMALL,
                             1.5, (0, 0, 0), 2)
 
-            # ---------------------------------- DeepSORT tacker work starts here ------------------------------------------------------------
-            features = self.encoder(frame,
-                                    bboxes)  # encode detections and feed to tracker. [No of BB / detections per frame, embed_size]
-            detections = [Detection(bbox, score, class_name, feature) for bbox, score, class_name, feature in
-                          zip(bboxes, scores, names,
-                              features)]  # [No of BB per frame] deep_sort.detection.Detection object
+            # ---------------------------------------- 3D PREDICTION START HERE ---------------------------------------------------------------------
 
-            cmap = plt.get_cmap('tab20b')  # initialize color map
-            colors = [cmap(i)[:3] for i in np.linspace(0, 1, 20)]
+            # idxs = cv2.dnn.NMSBoxes(bboxes, scores,0.3,0.3)
+            # print(idxs)
+            detections = []
+            for i in num_objects:
+                top_left = (bboxes[i][0], bboxes[i][1])
+                bottom_right = (top_left[0] + bboxes[i][2], top_left[1] + bboxes[i][3])
 
-            boxs = np.array([d.tlwh for d in detections])  # run non-maxima supression below
-            scores = np.array([d.confidence for d in detections])
-            classes = np.array([d.class_name for d in detections])
-            indices = preprocessing.non_max_suppression(boxs, classes, self.nms_max_overlap, scores)
-            detections = [detections[i] for i in indices]
+                box_2d = [top_left, bottom_right]
+                class_indx = int(classes[i])
+                class_name = self.class_names[class_indx]
+                class_ = class_name
 
-            self.tracker.predict()  # Call the tracker
-            self.tracker.update(detections) #  updtate using Kalman Gain
+                detections.append(Detection3D(box_2d, class_))
 
-            for track in self.tracker.tracks:  # update new findings AKA tracks
-                if not track.is_confirmed() or track.time_since_update > 1:
+            for detection in detections:
+                # this is throwing when the 2d bbox is invalid
+                # TODO: better check
+                try:
+                    detectedObject = DetectedObject(img, detection.detected_class, detection.box_2d, calib_file)
+                except:
                     continue
-                bbox = track.to_tlbr()
-                class_name = track.get_class()
 
-                color = colors[int(track.track_id) % len(colors)]  # draw bbox on screen
-                color = [i * 255 for i in color]
-                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
-                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
-                cv2.putText(frame, class_name + " : " + str(track.track_id),(int(bbox[0]), int(bbox[1]-11)),0, 0.6, (255,255,255),1, lineType=cv2.LINE_AA)
+                theta_ray = detectedObject.theta_ray
+                input_img = detectedObject.img
+                proj_matrix = detectedObject.proj_matrix
+                box_2d = detection.box_2d
+                detected_class = detection.detected_class
 
-                if verbose == 2:
-                    print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
+                input_tensor = torch.zeros([1, 3, 224, 224]).cuda()
+                input_tensor[0, :, :, :] = input_img
+
+                [orient, conf, dim] = model(input_tensor)
+                orient = orient.cpu().data.numpy()[0, :, :]
+                conf = conf.cpu().data.numpy()[0, :]
+                dim = dim.cpu().data.numpy()[0, :]
+
+                dim += averages.get_item(detected_class)
+
+                argmax = np.argmax(conf)
+                orient = orient[argmax, :]
+                cos = orient[0]
+                sin = orient[1]
+                alpha = np.arctan2(sin, cos)
+                alpha += angle_bins[argmax]
+                alpha -= np.pi
+
+                # if FLAGS.show_yolo:
+                #     location = plot_regressed_3d_bbox(img, proj_matrix, box_2d, dim, alpha, theta_ray, truth_img)
+                # else:
+                location = plot_regressed_3d_bbox(img, proj_matrix, box_2d, dim, alpha, theta_ray)
+
+                # if not FLAGS.hide_debug:
+                print('Estimated pose: %s' % location)
+
+            # ---------------------------------------- 3D PREDICTION END HERE ---------------------------------------------------------------------
+
+            # ---------------------------------- DeepSORT tacker work starts here ------------------------------------------------------------
+            # features = self.encoder(frame,
+            #                         bboxes)  # encode detections and feed to tracker. [No of BB / detections per frame, embed_size]
+            # detections = [Detection(bbox, score, class_name, feature) for bbox, score, class_name, feature in
+            #               zip(bboxes, scores, names,
+            #                   features)]  # [No of BB per frame] deep_sort.detection.Detection object
+            #
+            # cmap = plt.get_cmap('tab20b')  # initialize color map
+            # colors = [cmap(i)[:3] for i in np.linspace(0, 1, 20)]
+            #
+            # boxs = np.array([d.tlwh for d in detections])  # run non-maxima supression below
+            # scores = np.array([d.confidence for d in detections])
+            # classes = np.array([d.class_name for d in detections])
+            # indices = preprocessing.non_max_suppression(boxs, classes, self.nms_max_overlap, scores)
+            # detections = [detections[i] for i in indices]
+            #
+            # self.tracker.predict()  # Call the tracker
+            # self.tracker.update(detections)  # updtate using Kalman Gain
+            #
+            # for track in self.tracker.tracks:  # update new findings AKA tracks
+            #     if not track.is_confirmed() or track.time_since_update > 1:
+            #         continue
+            #     bbox = track.to_tlbr()
+            #     class_name = track.get_class()
+            #
+            #     color = colors[int(track.track_id) % len(colors)]  # draw bbox on screen
+            #     color = [i * 255 for i in color]
+            #     cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+            #     cv2.rectangle(frame, (int(bbox[0]), int(bbox[1] - 30)),
+            #                   (int(bbox[0]) + (len(class_name) + len(str(track.track_id))) * 17, int(bbox[1])), color,
+            #                   -1)
+            #     cv2.putText(frame, class_name + " : " + str(track.track_id), (int(bbox[0]), int(bbox[1] - 11)), 0, 0.6,
+            #                 (255, 255, 255), 1, lineType=cv2.LINE_AA)
+            #
+            #     if verbose == 2:
+            #         print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(
+            #             str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
 
             # -------------------------------- Tracker work ENDS here -----------------------------------------------------------------------
             if verbose >= 1:
