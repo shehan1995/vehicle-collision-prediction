@@ -1,18 +1,19 @@
 import numpy as np
 
+
 # using this math: https://en.wikipedia.org/wiki/Rotation_matrix
 def rotation_matrix(yaw, pitch=0, roll=0):
     tx = roll
     ty = yaw
     tz = pitch
 
-    Rx = np.array([[1,0,0], [0, np.cos(tx), -np.sin(tx)], [0, np.sin(tx), np.cos(tx)]])
+    Rx = np.array([[1, 0, 0], [0, np.cos(tx), -np.sin(tx)], [0, np.sin(tx), np.cos(tx)]])
     Ry = np.array([[np.cos(ty), 0, np.sin(ty)], [0, 1, 0], [-np.sin(ty), 0, np.cos(ty)]])
-    Rz = np.array([[np.cos(tz), -np.sin(tz), 0], [np.sin(tz), np.cos(tz), 0], [0,0,1]])
+    Rz = np.array([[np.cos(tz), -np.sin(tz), 0], [np.sin(tz), np.cos(tz), 0], [0, 0, 1]])
 
-
-    return Ry.reshape([3,3])
+    return Ry.reshape([3, 3])
     # return np.dot(np.dot(Rz,Ry), Rx)
+
 
 # option to rotate and shift (for label info)
 def create_corners(dimension, location=None, R=None):
@@ -25,11 +26,11 @@ def create_corners(dimension, location=None, R=None):
     z_corners = []
 
     for i in [1, -1]:
-        for j in [1,-1]:
-            for k in [1,-1]:
-                x_corners.append(dx*i)
-                y_corners.append(dy*j)
-                z_corners.append(dz*k)
+        for j in [1, -1]:
+            for k in [1, -1]:
+                x_corners.append(dx * i)
+                y_corners.append(dy * j)
+                z_corners.append(dz * k)
 
     corners = [x_corners, y_corners, z_corners]
 
@@ -39,21 +40,21 @@ def create_corners(dimension, location=None, R=None):
 
     # shift if location is passed in
     if location is not None:
-        for i,loc in enumerate(location):
-            corners[i,:] = corners[i,:] + loc
+        for i, loc in enumerate(location):
+            corners[i, :] = corners[i, :] + loc
 
     final_corners = []
     for i in range(8):
         final_corners.append([corners[0][i], corners[1][i], corners[2][i]])
 
-
     return final_corners
+
 
 # this is based on the paper. Math!
 # calib is a 3x4 matrix, box_2d is [(xmin, ymin), (xmax, ymax)]
 # Math help: http://ywpkwon.github.io/pdf/bbox3d-study.pdf
 def calc_location(dimension, proj_matrix, box_2d, alpha, theta_ray):
-    #global orientation
+    # global orientation
     orient = alpha + theta_ray
     R = rotation_matrix(orient)
 
@@ -106,18 +107,18 @@ def calc_location(dimension, proj_matrix, box_2d, alpha, theta_ray):
 
     # left and right could either be the front of the car ot the back of the car
     # careful to use left and right based on image, no of actual car's left and right
-    for i in (-1,1):
-        left_constraints.append([left_mult * dx, i*dy, -switch_mult * dz])
-    for i in (-1,1):
-        right_constraints.append([right_mult * dx, i*dy, switch_mult * dz])
+    for i in (-1, 1):
+        left_constraints.append([left_mult * dx, i * dy, -switch_mult * dz])
+    for i in (-1, 1):
+        right_constraints.append([right_mult * dx, i * dy, switch_mult * dz])
 
     # top and bottom are easy, just the top and bottom of car
-    for i in (-1,1):
-        for j in (-1,1):
-            top_constraints.append([i*dx, -dy, j*dz])
-    for i in (-1,1):
-        for j in (-1,1):
-            bottom_constraints.append([i*dx, dy, j*dz])
+    for i in (-1, 1):
+        for j in (-1, 1):
+            top_constraints.append([i * dx, -dy, j * dz])
+    for i in (-1, 1):
+        for j in (-1, 1):
+            bottom_constraints.append([i * dx, dy, j * dz])
 
     # now, 64 combinations
     for left in left_constraints:
@@ -130,11 +131,12 @@ def calc_location(dimension, proj_matrix, box_2d, alpha, theta_ray):
     constraints = filter(lambda x: len(x) == len(set(tuple(i) for i in x)), constraints)
 
     # create pre M (the term with I and the R*X)
-    pre_M = np.zeros([4,4])
+    pre_M = np.zeros([4, 4])
     # 1's down diagonal
-    for i in range(0,4):
+    for i in range(0, 4):
         pre_M[i][i] = 1
 
+    # best_loc = np.zeros((3,1))
     best_loc = None
     best_error = [1e09]
     best_X = None
@@ -160,29 +162,29 @@ def calc_location(dimension, proj_matrix, box_2d, alpha, theta_ray):
         M_array = [Ma, Mb, Mc, Md]
 
         # create A, b
-        A = np.zeros([4,3], dtype=np.float)
-        b = np.zeros([4,1])
+        A = np.zeros([4, 3], dtype=np.float)
+        b = np.zeros([4, 1])
 
-        indicies = [0,1,0,1]
+        indicies = [0, 1, 0, 1]
         for row, index in enumerate(indicies):
             X = X_array[row]
             M = M_array[row]
 
             # create M for corner Xx
             RX = np.dot(R, X)
-            M[:3,3] = RX.reshape(3)
+            M[:3, 3] = RX.reshape(3)
 
             M = np.dot(proj_matrix, M)
 
-            A[row, :] = M[index,:3] - box_corners[row] * M[2,:3]
-            b[row] = box_corners[row] * M[2,3] - M[index,3]
+            A[row, :] = M[index, :3] - box_corners[row] * M[2, :3]
+            b[row] = box_corners[row] * M[2, 3] - M[index, 3]
 
         # solve here with least squares, since over fit will get some error
         loc, error, rank, s = np.linalg.lstsq(A, b, rcond=None)
 
         # found a better estimation
         if error < best_error:
-            count += 1 # for debugging
+            count += 1  # for debugging
             best_loc = loc
             best_error = error
             best_X = X_array

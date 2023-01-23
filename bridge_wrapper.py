@@ -100,11 +100,12 @@ class YOLOv7_DeepSORT:
         calib_file = "calib_cam_to_cam.txt"
 
         # load model for 3D detection
-
+        mps_device = torch.device("mps")
         my_vgg = vgg.vgg19_bn(pretrained=True)
-        # TODO: load bins from file or something
-        model = Model.Model(features=my_vgg.features, bins=2).cuda()
-        checkpoint = torch.load("epoch_10.pkl")
+        # TODO: load bins from file or something]
+        model = Model.Model(features=my_vgg.features, bins=2)
+        model.to(mps_device)
+        checkpoint = torch.load("epoch_10.pkl", map_location=mps_device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
 
@@ -172,9 +173,9 @@ class YOLOv7_DeepSORT:
             # idxs = cv2.dnn.NMSBoxes(bboxes, scores,0.3,0.3)
             # print(idxs)
             detections = []
-            for i in num_objects:
-                top_left = (bboxes[i][0], bboxes[i][1])
-                bottom_right = (top_left[0] + bboxes[i][2], top_left[1] + bboxes[i][3])
+            for i in range(num_objects):
+                top_left = (int(bboxes[i][0]), int(bboxes[i][1]))
+                bottom_right = (int(top_left[0]) + int(bboxes[i][2]), int(top_left[1]) + int(bboxes[i][3]))
 
                 box_2d = [top_left, bottom_right]
                 class_indx = int(classes[i])
@@ -184,6 +185,9 @@ class YOLOv7_DeepSORT:
                 detections.append(Detection3D(box_2d, class_))
 
             for detection in detections:
+                if not averages.recognized_class(detection.detected_class):
+                    continue
+
                 # this is throwing when the 2d bbox is invalid
                 # TODO: better check
                 try:
@@ -197,7 +201,7 @@ class YOLOv7_DeepSORT:
                 box_2d = detection.box_2d
                 detected_class = detection.detected_class
 
-                input_tensor = torch.zeros([1, 3, 224, 224]).cuda()
+                input_tensor = torch.zeros([1, 3, 224, 224]).to('mps')
                 input_tensor[0, :, :, :] = input_img
 
                 [orient, conf, dim] = model(input_tensor)
@@ -219,10 +223,10 @@ class YOLOv7_DeepSORT:
                 #     location = plot_regressed_3d_bbox(img, proj_matrix, box_2d, dim, alpha, theta_ray, truth_img)
                 # else:
                 location = plot_regressed_3d_bbox(img, proj_matrix, box_2d, dim, alpha, theta_ray)
-
+                cv2.imshow('3D detections 123', img)
                 # if not FLAGS.hide_debug:
                 print('Estimated pose: %s' % location)
-
+                cv2.waitKey(1)
             # ---------------------------------------- 3D PREDICTION END HERE ---------------------------------------------------------------------
 
             # ---------------------------------- DeepSORT tacker work starts here ------------------------------------------------------------
@@ -264,21 +268,21 @@ class YOLOv7_DeepSORT:
             #             str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
 
             # -------------------------------- Tracker work ENDS here -----------------------------------------------------------------------
-            if verbose >= 1:
-                fps = 1.0 / (time.time() - start_time)  # calculate frames per second of running detections
-                if not count_objects:
-                    print(f"Processed frame no: {frame_num} || Current FPS: {round(fps, 2)}")
-                else:
-                    print(
-                        f"Processed frame no: {frame_num} || Current FPS: {round(fps, 2)} || Objects tracked: {count}")
-
-            result = np.asarray(frame)
-            result = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-            if output: out.write(result)  # save output video
-
-            if show_live:
-                cv2.imshow("Output Video", result)
-                if cv2.waitKey(1) & 0xFF == ord('q'): break
+            # if verbose >= 1:
+            #     fps = 1.0 / (time.time() - start_time)  # calculate frames per second of running detections
+            #     if not count_objects:
+            #         print(f"Processed frame no: {frame_num} || Current FPS: {round(fps, 2)}")
+            #     else:
+            #         print(
+            #             f"Processed frame no: {frame_num} || Current FPS: {round(fps, 2)} || Objects tracked: {count}")
+            #
+            # result = np.asarray(frame)
+            # result = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            #
+            # if output: out.write(result)  # save output video
+            #
+            # if show_live:
+            #     cv2.imshow("Output Video", result)
+            #     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
         cv2.destroyAllWindows()
