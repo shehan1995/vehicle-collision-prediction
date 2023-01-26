@@ -100,12 +100,12 @@ class YOLOv7_DeepSORT:
         calib_file = "calib_cam_to_cam.txt"
 
         # load model for 3D detection
-        mps_device = torch.device("mps")
+        # mps_device = torch.device("mps")
         my_vgg = vgg.vgg19_bn(pretrained=True)
         # TODO: load bins from file or something]
         model = Model.Model(features=my_vgg.features, bins=2)
-        model.to(mps_device)
-        checkpoint = torch.load("epoch_10.pkl", map_location=mps_device)
+        model.cpu()
+        checkpoint = torch.load("epoch_10.pkl", map_location='cpu')
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
 
@@ -201,7 +201,7 @@ class YOLOv7_DeepSORT:
                 box_2d = detection.box_2d
                 detected_class = detection.detected_class
 
-                input_tensor = torch.zeros([1, 3, 224, 224]).to('mps')
+                input_tensor = torch.zeros([1, 3, 224, 224]).to('cpu')
                 input_tensor[0, :, :, :] = input_img
 
                 [orient, conf, dim] = model(input_tensor)
