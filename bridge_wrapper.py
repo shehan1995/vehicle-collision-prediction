@@ -146,7 +146,7 @@ class YOLOv7_DeepSORT:
             indices = preprocessing.non_max_suppression(boxs, classes, self.nms_max_overlap, scores)
             detections = [detections[i] for i in indices]
 
-            num_frames = 20
+            num_frames = 1
             for i in range(num_frames):
                 self.tracker.predict()
                 if (i == 0) or (i == 19):
