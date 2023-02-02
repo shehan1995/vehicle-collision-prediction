@@ -73,6 +73,9 @@ class YOLOv7_DeepSORT:
             count_objects: count objects being tracked on screen
             verbose: print details on the screen allowed values 0,1,2
         '''
+
+        linePoints = np.zeros((0, 2), dtype=np.int32)
+
         try:  # begin video capture
             vid = cv2.VideoCapture(int(video))
         except:
@@ -165,10 +168,23 @@ class YOLOv7_DeepSORT:
                         cv2.putText(frame, class_name + " : " + str(track.track_id), (int(bbox[0]), int(bbox[1] - 11)),
                                     0,
                                     0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
                         if verbose == 2:
-                            print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(
-                                str(track.track_id), class_name,
-                                (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
+                            # print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(
+                            #     str(track.track_id), class_name,
+                            #     (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
+                            if track.track_id == 4:
+                                point = np.array([int(bbox[2]), int(bbox[3])], dtype=np.int32)
+                                linePoints = np.concatenate((linePoints, point.reshape(1, 2)))
+                                print("Tracker ID: {}, Class: {},  Distance (y_lower),(x_middle): {}".format(
+                                    str(track.track_id), class_name,
+                                    (int(bbox[1]), (int(bbox[2]) - int(bbox[0]) / 2))))
+
+                    for i in range(len(linePoints)-2):
+                        # frame = cv2.line(frame, (linePoints[i, 0], linePoints[i, 1]),(linePoints[i + 1, 0], linePoints[i + 1, 1]), (0, 0, 0))
+                        frame = cv2.line(frame, linePoints[i], linePoints[i + 1], (0, 0, 0))
+
+
                 print(i)
                 self.tracker.update(detections)
                 i += 1
@@ -199,6 +215,10 @@ class YOLOv7_DeepSORT:
                 else:
                     print(
                         f"Processed frame no: {frame_num} || Current FPS: {round(fps, 2)} || Objects tracked: {count}")
+
+            for i in range(len(linePoints) - 2):
+                # frame = cv2.line(frame, (linePoints[i, 0], linePoints[i, 1]),(linePoints[i + 1, 0], linePoints[i + 1, 1]), (0, 0, 0))
+                frame = cv2.line(frame, linePoints[i], linePoints[i + 1], (0, 0, 0))
 
             result = np.asarray(frame)
             result = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
