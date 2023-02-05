@@ -28,10 +28,29 @@ from deep_sort.tracker import Tracker
 from tracking_helpers import read_class_names, create_box_encoder
 from detection_helpers import *
 
+from detection_3d import Detection3D, DetectedObject
+from torch_lib import Model, ClassAverages
+from torchvision.models import vgg
+from library.Plotting import *
+
+
 # load configuration for object detector
 config = ConfigProto()
 config.gpu_options.allow_growth = True
 
+def plot_regressed_3d_bbox(img, cam_to_img, box_2d, dimensions, alpha, theta_ray, img_2d=None):
+
+    # the math! returns X, the corners used for constraint
+    location, X = calc_location(dimensions, cam_to_img, box_2d, alpha, theta_ray)
+
+    orient = alpha + theta_ray
+
+    if img_2d is not None:
+        plot_2d_box(img_2d, box_2d)
+
+    plot_3d_box(img, cam_to_img, orient, dimensions, location) # 3d boxes
+
+    return location
 
 class YOLOv7_DeepSORT:
     '''
@@ -81,6 +100,22 @@ class YOLOv7_DeepSORT:
         except:
             vid = cv2.VideoCapture(video)
 
+        calib_file = "calib_cam_to_cam.txt"
+
+        # load model for 3D detection
+        # mps_device = torch.device("mps")
+        my_vgg = vgg.vgg19_bn(pretrained=True)
+        # TODO: load bins from file or something]
+        model = Model.Model(features=my_vgg.features, bins=2)
+        model.cpu()
+        checkpoint = torch.load("epoch_10.pkl", map_location='cpu')
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+
+        averages = ClassAverages.ClassAverages()
+        # TODO: clean up how this is done. flag?
+        angle_bins = Detection3D.generate_bins(2)
+
         out = None
         if output:  # get video ready to save locally if flag is set
             width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))  # by default VideoCapture returns float instead of int
@@ -96,6 +131,9 @@ class YOLOv7_DeepSORT:
                 print('Video has ended or failed!')
                 break
             frame_num += 1
+
+            # for 3D detection
+            img = np.copy(frame)
 
             if skip_frames and not frame_num % skip_frames: continue  # skip every nth frame. When every frame is not important, you can use this to fasten the process
             if verbose >= 1: start_time = time.time()
@@ -132,6 +170,69 @@ class YOLOv7_DeepSORT:
             if count_objects:
                 cv2.putText(frame, "Objects being tracked: {}".format(count), (5, 35), cv2.FONT_HERSHEY_COMPLEX_SMALL,
                             1.5, (0, 0, 0), 2)
+
+
+            # ---------------------------------------- 3D PREDICTION START HERE ---------------------------------------------------------------------
+
+            # idxs = cv2.dnn.NMSBoxes(bboxes, scores,0.3,0.3)
+            # print(idxs)
+            detections = []
+            for i in range(num_objects):
+                top_left = (int(bboxes[i][0]), int(bboxes[i][1]))
+                bottom_right = (int(top_left[0]) + int(bboxes[i][2]), int(top_left[1]) + int(bboxes[i][3]))
+
+                box_2d = [top_left, bottom_right]
+                class_indx = int(classes[i])
+                class_name = self.class_names[class_indx]
+                class_ = class_name
+
+                detections.append(Detection3D(box_2d, class_))
+
+            for detection in detections:
+                if not averages.recognized_class(detection.detected_class):
+                    continue
+
+                # this is throwing when the 2d bbox is invalid
+                # TODO: better check
+                try:
+                    detectedObject = DetectedObject(img, detection.detected_class, detection.box_2d, calib_file)
+                except:
+                    continue
+
+                theta_ray = detectedObject.theta_ray
+                input_img = detectedObject.img
+                proj_matrix = detectedObject.proj_matrix
+                box_2d = detection.box_2d
+                detected_class = detection.detected_class
+
+                input_tensor = torch.zeros([1, 3, 224, 224]).to('cpu')
+                input_tensor[0, :, :, :] = input_img
+
+                [orient, conf, dim] = model(input_tensor)
+                orient = orient.cpu().data.numpy()[0, :, :]
+                conf = conf.cpu().data.numpy()[0, :]
+                dim = dim.cpu().data.numpy()[0, :]
+
+                dim += averages.get_item(detected_class)
+
+                argmax = np.argmax(conf)
+                orient = orient[argmax, :]
+                cos = orient[0]
+                sin = orient[1]
+                alpha = np.arctan2(sin, cos)
+                alpha += angle_bins[argmax]
+                alpha -= np.pi
+
+                # if FLAGS.show_yolo:
+                #     location = plot_regressed_3d_bbox(img, proj_matrix, box_2d, dim, alpha, theta_ray, truth_img)
+                # else:
+                location = plot_regressed_3d_bbox(img, proj_matrix, box_2d, dim, alpha, theta_ray)
+                cv2.imshow('3D detections 123', img)
+                # if not FLAGS.hide_debug:
+                print('Estimated pose: %s' % location)
+                cv2.waitKey(1)
+            # ---------------------------------------- 3D PREDICTION END HERE ---------------------------------------------------------------------
+
 
             # ---------------------------------- DeepSORT tacker work starts here ------------------------------------------------------------
             features = self.encoder(frame,
@@ -174,7 +275,7 @@ class YOLOv7_DeepSORT:
                     print("warnining")
 
                 if verbose == 2:
-                    print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
+                    # print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
                     if track.track_id == 4:
                         point = np.array([int(bbox[2]), int(bbox[3])], dtype=np.int32)
                         linePoints = np.concatenate((linePoints, point.reshape(1, 2)))
@@ -196,8 +297,8 @@ class YOLOv7_DeepSORT:
 
             if output: out.write(result)  # save output video
 
-            if show_live:
-                cv2.imshow("Output Video", result)
-                if cv2.waitKey(1) & 0xFF == ord('q'): break
+            # if show_live:
+                # cv2.imshow("Output Video", result)
+                # if cv2.waitKey(1) & 0xFF == ord('q'): break
 
         cv2.destroyAllWindows()
