@@ -1,8 +1,19 @@
 '''
 A Moduele which binds Yolov7 repo with Deepsort with modifications
 '''
+import torchvision.utils as vutils
 
 import os
+import shutil
+from typing import List
+
+import torchvision.models
+from PIL import Image as im
+from pytorch_lightning import LightningModule
+from torchvision.transforms import transforms
+
+from src import models
+from src.models.regressor import RegressorModel
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # comment out below line to enable tensorflow logging outputs
 import time
@@ -28,9 +39,56 @@ from deep_sort.tracker import Tracker
 from tracking_helpers import read_class_names, create_box_encoder
 from detection_helpers import *
 
+from src.utils import Calib
+from src.utils.averages import ClassAverages
+from src.utils.Plotting import calc_alpha, plot_3d_box
+from src.utils.Math import calc_location, compute_orientaion, recover_angle, translation_constraints
+from src.utils.Plotting import calc_theta_ray
+from src.utils.Plotting import Plot3DBoxBev
+import src.utils
+import src.models
+from src.utils.utils import KITTIObject
+import src.models.components.base as compbase
+
 # load configuration for object detector
 config = ConfigProto()
 config.gpu_options.allow_growth = True
+
+
+def predict_path(y_min_values):
+    # Assuming y_min_values is a list of the previous 5 y_min values for a vehicle
+    # and time_delta is the time elapsed between the last two measurements in seconds
+    # y_min_values = [300, 305, 310, 315, 320]
+    if len(y_min_values) < 5:
+        return np.zeros(1)
+    if len(y_min_values) > 15:
+        y_min_values = y_min_values[-15:]
+    time_delta = 0.033
+    n = len(y_min_values)
+    print(y_min_values)
+    # Convert y_min_values to a numpy array and create a corresponding array of time values
+    y_min_array = np.array(y_min_values)
+    time_array = np.array(range(n)) * time_delta
+
+    # Perform linear regression to fit a line to the points
+    slope, intercept = np.polyfit(time_array, y_min_array, 1)
+
+    # Calculate the velocity as the slope of the line
+    velocity = slope
+    # print("Velocity : ", velocity)
+
+    # ignore if relative velocity is less than a threshold
+
+    if velocity < 1:
+        return np.zeros(1)
+
+    predict_time_start = time_array[len(time_array) - 1] + time_delta
+    future_time_array = np.arange(predict_time_start, predict_time_start + 1.5, time_delta)
+    # take predictions for 1.5 seconds. avg react time
+    future_y_min_array = slope * future_time_array + intercept
+    # print("future :", future_y_min_array)
+    return future_y_min_array
+    # return future_y_min_array[-7:]
 
 
 class YOLOv7_DeepSORT:
@@ -73,6 +131,16 @@ class YOLOv7_DeepSORT:
             count_objects: count objects being tracked on screen
             verbose: print details on the screen allowed values 0,1,2
         '''
+
+        is_warning_3D = False
+        output_folder = 'outputs'
+        if os.path.exists(output_folder):
+            # if it exists, delete it
+            shutil.rmtree(output_folder)
+
+        # create the folder
+        os.makedirs(output_folder)
+
         try:  # begin video capture
             vid = cv2.VideoCapture(int(video))
         except:
@@ -86,26 +154,81 @@ class YOLOv7_DeepSORT:
             codec = cv2.VideoWriter_fourcc(*"XVID")
             out = cv2.VideoWriter(output, codec, fps, (width, height))
 
+        P2 = Calib.get_P('data/global_calib.txt')
+        # Define the mean and standard deviation for normalization
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+        preprocess: List[torch.nn.Module] = []
+
+        preprocess.append(transforms.ToTensor())
+        # preprocess.append(transforms.Normalize(mean=mean, std=std))
+        preprocess = transforms.Compose(preprocess)
+
+        # Instantiate backbone
+        backbone = torchvision.models.mobilenet_v3_small(pretrained=True)
+
+        # Instantiate RegressorNet
+        regressor_net = compbase.RegressorNet(backbone=backbone, bins=2)
+
+        # Instantiate RegressorModel
+        # Instantiate the RegressorModel
+        regressor: LightningModule = RegressorModel(
+            net=regressor_net,
+            optimizer="adam",
+            lr=0.001,
+            momentum=0.9,
+            w=0.4,
+            alpha=0.6
+        )
+        # regressor = RegressorModel(
+        #     net=regressor_net,
+        #     optimizer="adam",
+        #     lr=0.001,
+        #     momentum=0.9,
+        #     w=0.4,
+        #     alpha=0.6
+        # )
+        regressor.load_state_dict(torch.load('weights/mobilenetv3-best.pt', map_location='cpu'))
+        regressor.eval().to('cpu')
+
+        class_averages = ClassAverages()
+        tracking_threshold = 1000
         frame_num = 0
+        # Initialize an empty dictionary to store tracks
+        tracks = {}
+
         while True:  # while video is running
             return_value, frame = vid.read()
             if not return_value:
                 print('Video has ended or failed!')
                 break
             frame_num += 1
+            frame_for_3d = frame.copy()
 
-            if skip_frames and not frame_num % skip_frames: continue  # skip every nth frame. When every frame is not important, you can use this to fasten the process
-            if verbose >= 1: start_time = time.time()
+            if skip_frames and not frame_num % skip_frames:
+                continue  # skip every nth frame. When every frame is not important, you can use this to fasten the process
+            if verbose >= 1:
+                start_time = time.time()
 
             # -----------------------------------------PUT ANY DETECTION MODEL HERE -----------------------------------------------------------------
             yolo_dets = self.detector.detect(frame.copy(), plot_bb=False)  # Get the detections
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            xyxy_detections = []
+            # Create an empty list to store the cropped images
+            cropped_images = []
+            DIMENSION = []
+            plot3dbev = Plot3DBoxBev(P2)
+            cls_indexes = []
+
+            warning = False
 
             if yolo_dets is None:
                 bboxes = []
                 scores = []
                 classes = []
                 num_objects = 0
+
 
             else:
                 bboxes = yolo_dets[:, :4]
@@ -122,6 +245,16 @@ class YOLOv7_DeepSORT:
                 class_indx = int(classes[i])
                 class_name = self.class_names[class_indx]
                 names.append(class_name)
+                cls_indexes.append(int(classes[i]))
+
+                x, y, w, h = bboxes[i]
+                xmin, ymin = x, y
+                xmax, ymax = x + w, y + h
+                xyxy_detections.append([xmin, ymin, xmax, ymax])
+                cropped_image = frame_for_3d[int(ymin):int(ymax), int(xmin):int(xmax)]
+                cropped_images.append(cropped_image)
+
+                print("width :",w, "height :",h )
 
             names = np.array(names)
             count = len(names)
@@ -146,32 +279,54 @@ class YOLOv7_DeepSORT:
             indices = preprocessing.non_max_suppression(boxs, classes, self.nms_max_overlap, scores)
             detections = [detections[i] for i in indices]
 
-            num_frames = 1
-            for i in range(num_frames):
-                self.tracker.predict()
-                if (i == 0) or (i == 19):
+            self.tracker.predict()
 
-                    for track in self.tracker.tracks:
-                        if not track.is_confirmed() or track.time_since_update > 1:
-                            continue
-                        bbox = track.to_tlbr()
-                        class_name = track.get_class()
-                        color = colors[int(track.track_id) % len(colors)]
-                        color = [i * 255 for i in color]
-                        cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
-                        cv2.rectangle(frame, (int(bbox[0]), int(bbox[1] - 30)),
-                                      (int(bbox[0]) + (len(class_name) + len(str(track.track_id))) * 17, int(bbox[1])),
-                                      color, -1)
-                        cv2.putText(frame, class_name + " : " + str(track.track_id), (int(bbox[0]), int(bbox[1] - 11)),
-                                    0,
-                                    0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
-                        if verbose == 2:
-                            print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(
-                                str(track.track_id), class_name,
-                                (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
-                print(i)
-                self.tracker.update(detections)
-                i += 1
+            for track in self.tracker.tracks:
+                if not track.is_confirmed() or track.time_since_update > 1:
+                    continue
+
+                bbox = track.to_tlbr()
+                class_name = track.get_class()
+                color = colors[int(track.track_id) % len(colors)]
+                color = [i * 255 for i in color]
+                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1] - 30)),
+                              (int(bbox[0]) + (len(class_name) + len(str(track.track_id))) * 17, int(bbox[1])),
+                              color, -1)
+                cv2.putText(frame,  " : " + str(track.track_id), (int(bbox[0]), int(bbox[1] - 11)),
+                            0,
+                            0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+                # if verbose == 2:
+                # print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(
+                #     str(track.track_id), class_name,
+                #     (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
+                # todo print boxes
+
+                # Get the track ID and class name
+                track_id = str(track.track_id)
+                class_name = track.get_class()
+
+                # Get the y_min coordinate of the bounding box
+                y_min = int(track.to_tlbr()[3])
+                # Add the y_min coordinate to the track
+                if track_id in tracks:
+                    tracks[track_id]['y_min'].append(y_min)
+                else:
+                    tracks[track_id] = {'class': class_name, 'y_min': [y_min]}
+
+                prediction = predict_path(tracks[track_id]['y_min'])
+                if track_id == '3':
+                    print("id ", track_id, "y ", y_min, prediction)
+                if (len(prediction) > 1 and float(
+                        prediction[len(prediction) - 1]) > tracking_threshold) or y_min > tracking_threshold:
+                    warning = True
+                    print("warning by id : ", track_id)
+                    # if track_id != '21' and track_id != '16' and track_id != '7'  :
+                    #     time.sleep(10)
+                    # if track_id == '21' or track_id == '16' or track_id == '7'  :
+                    #     warning = False
+
+            self.tracker.update(detections)
 
             # self.tracker.predict()  # Call the tracker
             # self.tracker.update(detections) #  updtate using Kalman Gain
@@ -192,6 +347,63 @@ class YOLOv7_DeepSORT:
             #         print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
 
             # -------------------------------- Tracker work ENDS here -----------------------------------------------------------------------
+
+            # if frame_num < 150 :
+            #     continue
+
+            # 3D detection starting
+            for i in range(num_objects):
+                if not warning:
+                    # set default
+                    is_warning_3D = False
+                    # break
+                obj = KITTIObject()
+                obj.name = classes[i].capitalize()
+                obj.truncation = float(0.00)
+                obj.occlusion = int(-1)
+                obj.xmin, obj.ymin, obj.xmax, obj.ymax = xyxy_detections[i][0], xyxy_detections[i][1], \
+                    xyxy_detections[i][2], xyxy_detections[i][3]
+                # preprocess img with torch.transforms
+                crop = preprocess(cv2.resize(cropped_images[i], (224, 224)))
+                crop = crop.reshape((1, *crop.shape)).to('cpu')
+                # vutils.save_image(crop, "crop.jpg")
+                # data = im.fromarray(cropped_images[i])
+
+                # saving the final output
+                # as a PNG file
+                # data.save('gfg_dummy_pic.png')
+
+                # regress 2D bbox with Regressor
+                [orient, conf, dim] = regressor(crop)
+                orient = orient.cpu().detach().numpy()[0, :, :]
+                conf = conf.cpu().detach().numpy()[0, :]
+                dim = dim.cpu().detach().numpy()[0, :]
+
+                try:
+                    dim += class_averages.get_item(class_to_labels(cls_indexes[i]))
+                    DIMENSION.append(dim)
+                except:
+                    dim = DIMENSION[-1]
+
+                obj.alpha = recover_angle(orient, conf, 2)
+                obj.h, obj.w, obj.l = dim[0], dim[1], dim[2]
+                obj.rot_global, rot_local = compute_orientaion(P2, obj)
+                obj.tx, obj.ty, obj.tz = translation_constraints(P2, obj, rot_local)
+
+                is_warning_3D = plot3dbev.plot(
+                    img=frame_for_3d,
+                    class_object=obj.name.lower(),
+                    bbox=[obj.xmin, obj.ymin, obj.xmax, obj.ymax],
+                    dim=[obj.h, obj.w, obj.l],
+                    loc=[obj.tx, obj.ty, obj.tz],
+                    rot_y=obj.rot_global,
+                    file_name=frame_num,
+                )
+                plot3dbev.save_plot('outputs', frame_num)
+                # print(i)
+
+            # 3D detection ending
+
             if verbose >= 1:
                 fps = 1.0 / (time.time() - start_time)  # calculate frames per second of running detections
                 if not count_objects:
@@ -202,6 +414,16 @@ class YOLOv7_DeepSORT:
 
             result = np.asarray(frame)
             result = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            cv2.line(result, (0, tracking_threshold), (result.shape[1], tracking_threshold), (0, 0, 255), 2)
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+
+            if warning:
+                cv2.putText(result, 'Warning by 2D', (10, 100), font, 1, (0, 0, 255), 2, cv2.LINE_AA)
+            if is_warning_3D:
+                cv2.putText(result, 'Warning by 3D', (10, 50), font, 1, (0, 0, 255), 2, cv2.LINE_AA)
+            else:
+                cv2.putText(result, 'Safe', (10, 50), font, 1, (0, 255, 0), 2, cv2.LINE_AA)
 
             if output: out.write(result)  # save output video
 
@@ -210,3 +432,11 @@ class YOLOv7_DeepSORT:
                 if cv2.waitKey(1) & 0xFF == ord('q'): break
 
         cv2.destroyAllWindows()
+
+
+def class_to_labels(class_: int, list_labels: List = None):
+    if list_labels is None:
+        # TODO: change some labels mistakes
+        list_labels = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck']
+
+    return list_labels[int(class_)]
